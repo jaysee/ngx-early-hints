@@ -9,15 +9,13 @@ typedef struct {
 
 
 typedef struct {
-    unsigned      sent:1;
-} ngx_http_early_hints_ctx_t;
+    ngx_int_t  sent_index;        /* index of the $early_hints_sent variable */
+} ngx_http_early_hints_main_conf_t;
 
 
 static ngx_int_t ngx_http_early_hints_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_early_hints_is_document(ngx_http_request_t *r);
-static ngx_http_early_hints_ctx_t *ngx_http_early_hints_get_ctx(
-    ngx_http_request_t *r);
-static void ngx_http_early_hints_cleanup(void *data);
+static void *ngx_http_early_hints_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_early_hints_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_early_hints_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -43,7 +41,7 @@ static ngx_http_module_t  ngx_http_early_hints_module_ctx = {
     NULL,                                  /* preconfiguration */
     ngx_http_early_hints_init,             /* postconfiguration */
 
-    NULL,                                  /* create main configuration */
+    ngx_http_early_hints_create_main_conf, /* create main configuration */
     NULL,                                  /* init main configuration */
 
     NULL,                                  /* create server configuration */
@@ -73,13 +71,14 @@ ngx_module_t  ngx_http_early_hints_module = {
 static ngx_int_t
 ngx_http_early_hints_handler(ngx_http_request_t *r)
 {
-    ngx_str_t                         val;
-    ngx_uint_t                        i, nelts;
-    ngx_table_elt_t                  *h;
-    ngx_list_part_t                  *part;
-    ngx_http_complex_value_t         *cv;
-    ngx_http_early_hints_ctx_t       *ctx;
-    ngx_http_early_hints_loc_conf_t  *ehcf;
+    ngx_str_t                          val;
+    ngx_uint_t                         i, nelts;
+    ngx_table_elt_t                   *h;
+    ngx_list_part_t                   *part;
+    ngx_http_complex_value_t          *cv;
+    ngx_http_variable_value_t         *sent;
+    ngx_http_early_hints_loc_conf_t   *ehcf;
+    ngx_http_early_hints_main_conf_t  *ehmcf;
 
     if (r != r->main) {
         return NGX_DECLINED;
@@ -99,10 +98,20 @@ ngx_http_early_hints_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    // Deduplicate when doing  internal redirects, try_files, etc.
-    ctx = ngx_http_early_hints_get_ctx(r);
+    /*
+     * Deduplicate across internal redirects, try_files, etc. This is kept
+     * in an indexed request variable rather than the module ctx: nginx
+     * memzeroes r->ctx on every internal redirect (ngx_http_internal_redirect,
+     * ngx_http_named_location), but never touches r->variables, so the flag
+     * here actually survives where a ctx-based one would silently reset.
+     */
 
-    if (ctx && ctx->sent) {
+    ehmcf = ngx_http_get_module_main_conf(r, ngx_http_early_hints_module);
+    sent = &r->variables[ehmcf->sent_index];
+
+    if (sent->valid && sent->not_found == 0 && sent->len == 1
+        && sent->data[0] == '1')
+    {
         return NGX_DECLINED;
     }
 
@@ -162,13 +171,11 @@ ngx_http_early_hints_handler(ngx_http_request_t *r)
     part->next = NULL;
     r->headers_out.headers.last = part;
 
-    if (ctx == NULL) {
-        ctx = ngx_http_early_hints_get_ctx(r);
-    }
-
-    if (ctx) {
-        ctx->sent = 1;
-    }
+    sent->valid = 1;
+    sent->not_found = 0;
+    sent->no_cacheable = 1;
+    sent->len = 1;
+    sent->data = (u_char *) "1";
 
     return NGX_DECLINED;
 }
@@ -217,50 +224,19 @@ ngx_http_early_hints_is_document(ngx_http_request_t *r)
 }
 
 
-// Copied from realip module for tracking state accross internal redirects
-static ngx_http_early_hints_ctx_t *
-ngx_http_early_hints_get_ctx(ngx_http_request_t *r)
+static void *
+ngx_http_early_hints_create_main_conf(ngx_conf_t *cf)
 {
-    ngx_pool_cleanup_t          *cln;
-    ngx_http_early_hints_ctx_t  *ctx;
+    ngx_http_early_hints_main_conf_t  *ehmcf;
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_early_hints_module);
-
-    if (ctx == NULL && r->internal) {
-
-        for (cln = r->pool->cleanup; cln; cln = cln->next) {
-            if (cln->handler == ngx_http_early_hints_cleanup) {
-                ctx = cln->data;
-                ngx_http_set_ctx(r, ctx, ngx_http_early_hints_module);
-                break;
-            }
-        }
+    ehmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_early_hints_main_conf_t));
+    if (ehmcf == NULL) {
+        return NULL;
     }
 
-    if (ctx == NULL) {
+    ehmcf->sent_index = NGX_ERROR;
 
-        cln = ngx_pool_cleanup_add(r->pool,
-                                   sizeof(ngx_http_early_hints_ctx_t));
-        if (cln == NULL) {
-            return NULL;
-        }
-
-        cln->handler = ngx_http_early_hints_cleanup;
-
-        ctx = cln->data;
-        ctx->sent = 0;
-
-        ngx_http_set_ctx(r, ctx, ngx_http_early_hints_module);
-    }
-
-    return ctx;
-}
-
-
-static void
-ngx_http_early_hints_cleanup(void *data)
-{
-    /* the context is only used as a marker, nothing to clean up */
+    return ehmcf;
 }
 
 
@@ -333,8 +309,21 @@ ngx_http_early_hints_link(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static ngx_int_t
 ngx_http_early_hints_init(ngx_conf_t *cf)
 {
-    ngx_http_handler_pt        *h;
-    ngx_http_core_main_conf_t  *cmcf;
+    ngx_str_t                          name;
+    ngx_int_t                          index;
+    ngx_http_handler_pt               *h;
+    ngx_http_core_main_conf_t         *cmcf;
+    ngx_http_early_hints_main_conf_t  *ehmcf;
+
+    ngx_str_set(&name, "early_hints_sent");
+
+    index = ngx_http_get_variable_index(cf, &name);
+    if (index == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    ehmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_early_hints_module);
+    ehmcf->sent_index = index;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
