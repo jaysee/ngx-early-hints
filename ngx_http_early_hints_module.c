@@ -15,6 +15,8 @@ typedef struct {
 
 static ngx_int_t ngx_http_early_hints_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_early_hints_is_document(ngx_http_request_t *r);
+static ngx_int_t ngx_http_early_hints_sent_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 static void *ngx_http_early_hints_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_early_hints_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_early_hints_merge_loc_conf(ngx_conf_t *cf, void *parent,
@@ -307,10 +309,27 @@ ngx_http_early_hints_link(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 static ngx_int_t
+ngx_http_early_hints_sent_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    /*
+     * Never actually invoked: the handler reads/writes r->variables[index]
+     * directly. This only exists so ngx_http_variables_init_vars() does not
+     * reject $early_hints_sent as an "unknown" variable at config load time.
+     */
+
+    v->not_found = 1;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_http_early_hints_init(ngx_conf_t *cf)
 {
     ngx_str_t                          name;
     ngx_int_t                          index;
+    ngx_http_variable_t               *var;
     ngx_http_handler_pt               *h;
     ngx_http_core_main_conf_t         *cmcf;
     ngx_http_early_hints_main_conf_t  *ehmcf;
@@ -322,10 +341,13 @@ ngx_http_early_hints_init(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    var = cmcf->variables.elts;
+    var[index].get_handler = ngx_http_early_hints_sent_variable;
+    var[index].data = 0;
+
     ehmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_early_hints_module);
     ehmcf->sent_index = index;
-
-    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
     // As early as possible, but after NGX_HTTP_ACCESS_PHASE to avoid leaks
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
