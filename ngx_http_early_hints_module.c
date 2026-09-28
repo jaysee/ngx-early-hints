@@ -17,6 +17,7 @@ static ngx_int_t ngx_http_early_hints_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_early_hints_is_document(ngx_http_request_t *r);
 static ngx_int_t ngx_http_early_hints_sent_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_early_hints_add_variables(ngx_conf_t *cf);
 static void *ngx_http_early_hints_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_early_hints_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_early_hints_merge_loc_conf(ngx_conf_t *cf, void *parent,
@@ -40,7 +41,7 @@ static ngx_command_t  ngx_http_early_hints_commands[] = {
 
 
 static ngx_http_module_t  ngx_http_early_hints_module_ctx = {
-    NULL,                                  /* preconfiguration */
+    ngx_http_early_hints_add_variables,    /* preconfiguration */
     ngx_http_early_hints_init,             /* postconfiguration */
 
     ngx_http_early_hints_create_main_conf, /* create main configuration */
@@ -175,7 +176,7 @@ ngx_http_early_hints_handler(ngx_http_request_t *r)
 
     sent->valid = 1;
     sent->not_found = 0;
-    sent->no_cacheable = 1;
+    sent->no_cacheable = 0;
     sent->len = 1;
     sent->data = (u_char *) "1";
 
@@ -313,12 +314,36 @@ ngx_http_early_hints_sent_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     /*
-     * Never actually invoked: the handler reads/writes r->variables[index]
-     * directly. This only exists so ngx_http_variables_init_vars() does not
-     * reject $early_hints_sent as an "unknown" variable at config load time.
+     * Only reached before the handler set the value (r->variables[index]
+     * not valid yet): nothing sent. Once set, the value is cacheable, so
+     * reads by name (njs r.variables) or by index return it as is.
      */
 
     v->not_found = 1;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Declared as a real variable, not only indexed: without it, it is missing
+ * from the variables hash, and lookups by name (njs r.variables) never find
+ * it.
+ */
+static ngx_int_t
+ngx_http_early_hints_add_variables(ngx_conf_t *cf)
+{
+    ngx_str_t             name;
+    ngx_http_variable_t  *var;
+
+    ngx_str_set(&name, "early_hints_sent");
+
+    var = ngx_http_add_variable(cf, &name, 0);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_early_hints_sent_variable;
 
     return NGX_OK;
 }
@@ -329,7 +354,6 @@ ngx_http_early_hints_init(ngx_conf_t *cf)
 {
     ngx_str_t                          name;
     ngx_int_t                          index;
-    ngx_http_variable_t               *var;
     ngx_http_handler_pt               *h;
     ngx_http_core_main_conf_t         *cmcf;
     ngx_http_early_hints_main_conf_t  *ehmcf;
@@ -342,9 +366,6 @@ ngx_http_early_hints_init(ngx_conf_t *cf)
     }
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-    var = cmcf->variables.elts;
-    var[index].get_handler = ngx_http_early_hints_sent_variable;
-    var[index].data = 0;
 
     ehmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_early_hints_module);
     ehmcf->sent_index = index;
